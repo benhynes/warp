@@ -1,10 +1,16 @@
 use std::cell::RefCell;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use chrono::{DateTime, Local, TimeDelta};
 use futures::channel::oneshot;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use tokio::io::AsyncWriteExt as _;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use tokio::process::Command;
 use uuid::Uuid;
 use warp_errors::report_error;
 #[cfg(not(target_family = "wasm"))]
@@ -266,6 +272,12 @@ impl ResponseStream {
         cancellation_rx: oneshot::Receiver<()>,
         ctx: &mut ModelContext<Self>,
     ) {
+        #[cfg(all(feature = "tui", not(target_family = "wasm")))]
+        if crate::tui::tui_inference_provider() == crate::tui::TuiInferenceProvider::Codex {
+            Self::spawn_codex_generate(request_id, params, cancellation_rx, ctx);
+            return;
+        }
+
         // The Grok subscription and its OAuth refresh are native-only.
         #[cfg(not(target_family = "wasm"))]
         {
@@ -386,6 +398,38 @@ impl ResponseStream {
         }
 
         Self::spawn_generate(request_id, params, cancellation_rx, ctx);
+    }
+
+    #[cfg(all(feature = "tui", not(target_family = "wasm")))]
+    fn spawn_codex_generate(
+        request_id: Uuid,
+        params: api::RequestParams,
+        cancellation_rx: oneshot::Receiver<()>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let _ = ctx.spawn(
+            run_codex_request(params, cancellation_rx),
+            move |me, result, ctx| {
+                if me.current_request_id != Some(request_id) {
+                    return;
+                }
+                match result {
+                    Ok(events) => {
+                        for event in events {
+                            me.handle_response_stream_event(request_id, Ok(event), ctx);
+                        }
+                    }
+                    Err(error) => {
+                        me.handle_response_stream_event(
+                            request_id,
+                            Err(Arc::new(AIApiError::Other(error))),
+                            ctx,
+                        );
+                    }
+                }
+                me.on_response_stream_complete(request_id, ctx);
+            },
+        );
     }
 
     /// Emits a terminal, user-visible error for a failed request-time Grok token
@@ -735,6 +779,221 @@ impl ResponseStream {
             me.retry(ctx);
         });
     }
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+struct CodexExecOutput {
+    thread_id: String,
+    message: String,
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+async fn run_codex_request(
+    params: api::RequestParams,
+    mut cancellation_rx: oneshot::Receiver<()>,
+) -> anyhow::Result<Vec<warp_multi_agent_api::ResponseEvent>> {
+    let prompt = params
+        .input
+        .iter()
+        .rev()
+        .find_map(|input| input.user_query())
+        .ok_or_else(|| anyhow!("Codex inference currently supports user prompts only"))?;
+    let (task_id, create_root_task) = params
+        .tasks
+        .first()
+        .map(|task| (task.id.clone(), false))
+        .unwrap_or_else(|| (Uuid::new_v4().to_string(), true));
+    let existing_thread_id = params
+        .conversation_token
+        .as_ref()
+        .map(|token| token.as_str().to_owned());
+
+    let mut command = Command::new("codex");
+    command.arg("exec");
+    if let Some(thread_id) = &existing_thread_id {
+        command.args(["resume", "--json", "--skip-git-repo-check", thread_id, "-"]);
+    } else {
+        command.args([
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "-",
+        ]);
+    }
+    if let Some(working_directory) = params.session_context.current_working_directory() {
+        command.current_dir(working_directory);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| anyhow!("Failed to launch Codex CLI: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Failed to open Codex CLI stdin"))?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|error| anyhow!("Failed to send the prompt to Codex CLI: {error}"))?;
+    drop(stdin);
+
+    let output = tokio::select! {
+        output = child.wait_with_output() => output
+            .map_err(|error| anyhow!("Failed while waiting for Codex CLI: {error}"))?,
+        _ = &mut cancellation_rx => return Err(anyhow!("Codex request cancelled")),
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !output.status.success() {
+        let detail = if stderr.is_empty() {
+            format!("Codex CLI exited with {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(anyhow!(detail));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| anyhow!("Codex CLI returned invalid UTF-8: {error}"))?;
+    let codex_output = parse_codex_jsonl(&stdout, existing_thread_id.as_deref())?;
+    Ok(codex_response_events(
+        &task_id,
+        &codex_output.thread_id,
+        &codex_output.message,
+        create_root_task,
+    ))
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn parse_codex_jsonl(
+    stdout: &str,
+    existing_thread_id: Option<&str>,
+) -> anyhow::Result<CodexExecOutput> {
+    let mut thread_id = existing_thread_id.map(str::to_owned);
+    let mut message = None;
+    let mut failure = None;
+
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let event: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| anyhow!("Codex CLI returned invalid JSONL: {error}"))?;
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("thread.started") => {
+                thread_id = event
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("item.completed")
+                if event
+                    .pointer("/item/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("agent_message") =>
+            {
+                message = event
+                    .pointer("/item/text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("turn.failed") | Some("error") => {
+                failure = event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    if let Some(failure) = failure {
+        return Err(anyhow!(failure));
+    }
+    Ok(CodexExecOutput {
+        thread_id: thread_id.ok_or_else(|| anyhow!("Codex CLI did not return a thread ID"))?,
+        message: message.ok_or_else(|| anyhow!("Codex CLI did not return an agent message"))?,
+    })
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn codex_response_events(
+    task_id: &str,
+    thread_id: &str,
+    message: &str,
+    create_root_task: bool,
+) -> Vec<warp_multi_agent_api::ResponseEvent> {
+    use warp_multi_agent_api::client_action;
+    use warp_multi_agent_api::response_event::{self, stream_finished};
+
+    let request_id = Uuid::new_v4().to_string();
+    let mut actions = Vec::with_capacity(if create_root_task { 2 } else { 1 });
+    if create_root_task {
+        actions.push(warp_multi_agent_api::ClientAction {
+            action: Some(client_action::Action::CreateTask(
+                client_action::CreateTask {
+                    task: Some(warp_multi_agent_api::Task {
+                        id: task_id.to_owned(),
+                        messages: vec![],
+                        dependencies: None,
+                        description: String::new(),
+                        summary: String::new(),
+                        server_data: String::new(),
+                    }),
+                },
+            )),
+        });
+    }
+    actions.push(warp_multi_agent_api::ClientAction {
+        action: Some(client_action::Action::AddMessagesToTask(
+            client_action::AddMessagesToTask {
+                task_id: task_id.to_owned(),
+                messages: vec![warp_multi_agent_api::Message {
+                    fetched_memories: vec![],
+                    id: Uuid::new_v4().to_string(),
+                    task_id: task_id.to_owned(),
+                    server_message_data: String::new(),
+                    citations: vec![],
+                    message: Some(warp_multi_agent_api::message::Message::AgentOutput(
+                        warp_multi_agent_api::message::AgentOutput {
+                            text: message.to_owned(),
+                        },
+                    )),
+                    request_id: request_id.clone(),
+                    timestamp: None,
+                }],
+            },
+        )),
+    });
+
+    vec![
+        warp_multi_agent_api::ResponseEvent {
+            r#type: Some(response_event::Type::Init(response_event::StreamInit {
+                request_id: request_id.clone(),
+                conversation_id: thread_id.to_owned(),
+                run_id: String::new(),
+            })),
+        },
+        warp_multi_agent_api::ResponseEvent {
+            r#type: Some(response_event::Type::ClientActions(
+                response_event::ClientActions { actions },
+            )),
+        },
+        warp_multi_agent_api::ResponseEvent {
+            r#type: Some(response_event::Type::Finished(
+                response_event::StreamFinished {
+                    reason: Some(stream_finished::Reason::Done(stream_finished::Done {})),
+                    conversation_usage_metadata: None,
+                    token_usage: vec![],
+                    should_refresh_model_config: false,
+                    request_cost: None,
+                },
+            )),
+        },
+    ]
 }
 
 /// Applies the result of a request-time GEAP mint to the request snapshot.

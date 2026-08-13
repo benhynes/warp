@@ -5,7 +5,7 @@ use warpui::platform::WindowStyle;
 use warpui::{AddWindowOptions, SingletonEntity};
 use warpui_core::App;
 
-use super::{TuiArgs, ensure_terminal_session, parse_resume_token};
+use super::{InferenceProviderArg, TuiArgs, ensure_terminal_session, parse_resume_token};
 use crate::root_view::RootTuiView;
 use crate::session_registry::TuiSessions;
 use crate::test_fixtures::{add_test_semantic_selection, add_test_terminal_session};
@@ -16,6 +16,14 @@ fn parses_provider_api_key_setup_flag() {
         .expect("provider API-key setup arguments should parse");
 
     assert_eq!(args.set_provider_api_key, Some(LLMProvider::Anthropic));
+}
+
+#[test]
+fn parses_codex_inference_provider() {
+    let args = TuiArgs::try_parse_from(["warp", "--provider", "codex"])
+        .expect("Codex provider arguments should parse");
+
+    assert_eq!(args.provider, InferenceProviderArg::Codex);
 }
 #[test]
 fn parses_provider_api_key_clear_flag() {
@@ -131,6 +139,7 @@ fn accepts_startup_without_resume() {
     assert_eq!(args.resume, None);
     assert!(!args.auto_approve);
     assert_eq!(args.api_key, None);
+    assert_eq!(args.provider, InferenceProviderArg::Warp);
     assert_eq!(args.set_provider_api_key, None);
     assert_eq!(args.clear_provider_api_key, None);
 }

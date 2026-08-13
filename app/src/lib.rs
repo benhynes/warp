@@ -318,7 +318,10 @@ use crate::terminal::resizable_data::ResizableData;
 use crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState;
 use crate::terminal::{AudibleBell, CustomSecretRegexUpdater, History};
 #[cfg(feature = "tui")]
-pub use crate::tui::{TuiLoginEvent, TuiLoginModel, TuiLoginPhase, log_out_tui};
+pub use crate::tui::{
+    TuiInferenceProvider, TuiLoginEvent, TuiLoginModel, TuiLoginPhase, log_out_tui,
+    set_tui_inference_provider, tui_inference_provider,
+};
 use crate::undo_close::UndoCloseStack;
 use crate::user_config::WarpConfig;
 use crate::util::bindings::is_binding_cross_platform;

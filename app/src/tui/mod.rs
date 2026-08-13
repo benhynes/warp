@@ -9,6 +9,8 @@ mod mcp;
 mod telemetry;
 mod user_info;
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 pub use mcp::{
     TuiMcpAction, TuiMcpConfigDiagnostic, TuiMcpFileScope, TuiMcpFileSource, TuiMcpInstallRequest,
     TuiMcpManager, TuiMcpManagerEvent, TuiMcpServerId, TuiMcpServerSnapshot, TuiMcpServerSource,
@@ -29,6 +31,35 @@ use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::auth::auth_state::AuthState;
 use crate::auth::{self, AuthStateProvider};
 use crate::tui_onboarding_markers::TuiOnboardingMarkers;
+
+/// Inference backend selected by the standalone Warp Agent CLI.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TuiInferenceProvider {
+    #[default]
+    Warp,
+    Codex,
+}
+
+static TUI_INFERENCE_PROVIDER: AtomicU8 = AtomicU8::new(0);
+
+/// Selects the inference backend before the TUI app is mounted.
+pub fn set_tui_inference_provider(provider: TuiInferenceProvider) {
+    TUI_INFERENCE_PROVIDER.store(
+        match provider {
+            TuiInferenceProvider::Warp => 0,
+            TuiInferenceProvider::Codex => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Returns the inference backend selected for this TUI process.
+pub fn tui_inference_provider() -> TuiInferenceProvider {
+    match TUI_INFERENCE_PROVIDER.load(Ordering::Relaxed) {
+        1 => TuiInferenceProvider::Codex,
+        _ => TuiInferenceProvider::Warp,
+    }
+}
 
 /// Login state of the headless TUI, observed by the `warp_tui` root view to
 /// decide whether to show the login placeholder or the input UI.
@@ -207,7 +238,12 @@ impl SingletonEntity for TuiLoginModel {}
 /// Registers the [`TuiLoginModel`], mounts the TUI immediately, and shows an
 /// explicit welcome screen when the user isn't already logged in.
 pub(crate) fn init(mount: TuiMountFn, ctx: &mut AppContext) {
-    let initial_phase = initial_login_phase(AuthStateProvider::as_ref(ctx).get());
+    let has_warp_identity = has_validated_identity(AuthStateProvider::as_ref(ctx).get());
+    let initial_phase = if tui_inference_provider() == TuiInferenceProvider::Codex {
+        TuiLoginPhase::LoggedIn
+    } else {
+        initial_login_phase(AuthStateProvider::as_ref(ctx).get())
+    };
     let logged_in = matches!(&initial_phase, TuiLoginPhase::LoggedIn);
     ctx.add_singleton_model(move |_| TuiLoginModel {
         phase: initial_phase,
@@ -223,7 +259,7 @@ pub(crate) fn init(mount: TuiMountFn, ctx: &mut AppContext) {
     ctx.subscribe_to_model(&AuthManager::handle(ctx), |_, event, ctx| {
         handle_auth_manager_event(event, ctx);
     });
-    if logged_in {
+    if has_warp_identity {
         onboarding_markers.update(ctx, |markers, ctx| {
             markers.load_current_account(ctx);
         });
@@ -232,7 +268,7 @@ pub(crate) fn init(mount: TuiMountFn, ctx: &mut AppContext) {
     // welcome screen before explicitly starting browser authentication.
     mount(ctx);
 
-    if logged_in {
+    if has_warp_identity {
         activate_global_mcp_servers(ctx);
     }
 }

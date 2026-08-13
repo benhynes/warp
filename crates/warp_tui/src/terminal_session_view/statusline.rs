@@ -447,6 +447,14 @@ impl TuiTerminalSessionView {
                     .vim_mode_indicator(ctx)
                     .map(FooterSegment::VimIndicator),
                 TuiStatuslineItem::Model => (!shell_mode).then(|| {
+                    if warp::tui_inference_provider() == warp::TuiInferenceProvider::Codex {
+                        return FooterSegment::Model(
+                            TuiText::new("Codex (ChatGPT)")
+                                .with_style(builder.muted_text_style())
+                                .truncate()
+                                .finish(),
+                        );
+                    }
                     let model_name = LLMPreferences::as_ref(ctx)
                         .get_active_base_model(ctx, Some(self.terminal_surface_id))
                         .display_name

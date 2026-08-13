@@ -37,6 +37,19 @@
 
 You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.
 
+## Codex via ChatGPT subscription
+
+This fork adds a local inference backend to the standalone Warp Agent CLI. It reuses the OAuth session from the installed [Codex CLI](https://developers.openai.com/codex/cli) and does not require a Warp login or consume Warp credits.
+
+```bash
+codex login
+codex login status
+cargo build -p warp_tui --bin warp-tui-oss
+./target/debug/warp-tui-oss --provider codex
+```
+
+Initial prompts create a Codex thread and follow-up prompts resume it for the life of the Warp session. Codex runs with its `workspace-write` sandbox. The adapter currently returns completed agent messages rather than token-by-token output, and `--resume` across Warp process restarts remains tied to Warp's conversation service.
+
 ## Warp Contributions Overview Dashboard
 
 Explore [build.warp.dev](https://build.warp.dev) to:

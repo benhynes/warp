@@ -1,6 +1,8 @@
 #[cfg(not(target_family = "wasm"))]
 use super::apply_geap_refresh_to_params;
 use super::{RecoveryAction, recovery_action};
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use super::{codex_response_events, parse_codex_jsonl};
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::agent::api::RequestParams;
 
@@ -85,6 +87,76 @@ fn non_recoverable_post_action_failure_is_terminal() {
         recovery_action(true, false, true, true, true),
         RecoveryAction::Fail
     );
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn parses_codex_thread_and_final_message() {
+    let output = parse_codex_jsonl(
+        r#"{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done."}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        None,
+    )
+    .expect("valid Codex JSONL should parse");
+
+    assert_eq!(output.thread_id, "0199a213-81c0-7800-8aa1-bbab2a035a53");
+    assert_eq!(output.message, "Done.");
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn resumed_codex_output_reuses_existing_thread_id() {
+    let output = parse_codex_jsonl(
+        r#"{"type":"item.completed","item":{"type":"agent_message","text":"Follow-up."}}
+{"type":"turn.completed"}"#,
+        Some("0199a213-81c0-7800-8aa1-bbab2a035a53"),
+    )
+    .expect("resume output should use the requested thread ID");
+
+    assert_eq!(output.thread_id, "0199a213-81c0-7800-8aa1-bbab2a035a53");
+    assert_eq!(output.message, "Follow-up.");
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn codex_output_maps_to_warp_response_events() {
+    let events = codex_response_events("root-task", "thread-id", "Hello from Codex", false);
+
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        events[0].r#type,
+        Some(warp_multi_agent_api::response_event::Type::Init(_))
+    ));
+    assert!(matches!(
+        events[1].r#type,
+        Some(warp_multi_agent_api::response_event::Type::ClientActions(_))
+    ));
+    assert!(matches!(
+        events[2].r#type,
+        Some(warp_multi_agent_api::response_event::Type::Finished(_))
+    ));
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn first_codex_output_creates_the_optimistic_root_task() {
+    let events = codex_response_events("root-task", "thread-id", "Hello from Codex", true);
+    let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) =
+        &events[1].r#type
+    else {
+        panic!("expected client actions");
+    };
+
+    assert!(matches!(
+        actions.actions[0].action,
+        Some(warp_multi_agent_api::client_action::Action::CreateTask(_))
+    ));
+    assert!(matches!(
+        actions.actions[1].action,
+        Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(_))
+    ));
 }
 
 #[cfg(not(target_family = "wasm"))]

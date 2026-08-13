@@ -10,8 +10,8 @@ use std::io::{self, IsTerminal as _, Read as _};
 use ai::LLMProvider;
 use ai::api_keys::ApiKeyManager;
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
 use clap::error::ErrorKind;
+use clap::{Parser, ValueEnum};
 use inquire::{InquireError, Password, PasswordDisplayMode};
 use warp::settings::{TuiThemeSettings, TuiZeroStateSettings, TuiZeroStateSettingsChangedEvent};
 #[cfg(feature = "voice_input")]
@@ -47,6 +47,13 @@ const CLI_VERSION: &str = match option_env!("GIT_RELEASE_TAG") {
     None => "v0.0.0.0.0.0",
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum InferenceProviderArg {
+    #[default]
+    Warp,
+    Codex,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "warp", version = CLI_VERSION)]
 struct TuiArgs {
@@ -61,6 +68,10 @@ struct TuiArgs {
     /// API key for non-interactive authentication.
     #[arg(long, env = "WARP_API_KEY")]
     api_key: Option<String>,
+
+    /// Inference backend. `codex` reuses the local Codex CLI's ChatGPT login.
+    #[arg(long, value_enum, default_value = "warp")]
+    provider: InferenceProviderArg,
 
     /// Securely store a model-provider API key for Warp Agent CLI.
     #[arg(
@@ -165,6 +176,10 @@ pub fn run() -> Result<()> {
             None => None,
         }
     };
+    warp::set_tui_inference_provider(match args.provider {
+        InferenceProviderArg::Warp => warp::TuiInferenceProvider::Warp,
+        InferenceProviderArg::Codex => warp::TuiInferenceProvider::Codex,
+    });
     if let Some(command) = provider_api_key_command {
         return warp::run_tui_cli_command(Box::new(move |ctx| {
             let (provider, api_key, success_verb) = match command {
