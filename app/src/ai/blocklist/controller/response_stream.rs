@@ -1,14 +1,22 @@
 use std::cell::RefCell;
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use std::collections::HashMap;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use std::time::Duration;
 
 use anyhow::anyhow;
 use chrono::{DateTime, Local, TimeDelta};
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+use futures::channel::mpsc;
 use futures::channel::oneshot;
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, BufWriter,
+};
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
 use tokio::process::Command;
 use uuid::Uuid;
@@ -408,26 +416,9 @@ impl ResponseStream {
         ctx: &mut ModelContext<Self>,
     ) {
         let _ = ctx.spawn(
-            run_codex_request(params, cancellation_rx),
-            move |me, result, ctx| {
-                if me.current_request_id != Some(request_id) {
-                    return;
-                }
-                match result {
-                    Ok(events) => {
-                        for event in events {
-                            me.handle_response_stream_event(request_id, Ok(event), ctx);
-                        }
-                    }
-                    Err(error) => {
-                        me.handle_response_stream_event(
-                            request_id,
-                            Err(Arc::new(AIApiError::Other(error))),
-                            ctx,
-                        );
-                    }
-                }
-                me.on_response_stream_complete(request_id, ctx);
+            async move { codex_app_server_stream(params, cancellation_rx) },
+            move |me, stream, ctx| {
+                me.handle_response_stream_result(request_id, Ok(stream), ctx);
             },
         );
     }
@@ -782,22 +773,43 @@ impl ResponseStream {
 }
 
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
-struct CodexExecOutput {
-    thread_id: String,
-    message: String,
+const CODEX_INITIALIZE_REQUEST_ID: i64 = 0;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+const CODEX_THREAD_REQUEST_ID: i64 = 1;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+const CODEX_TURN_REQUEST_ID: i64 = 2;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+const CODEX_INTERRUPT_REQUEST_ID: i64 = 3;
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+const CODEX_MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn codex_app_server_stream(
+    params: api::RequestParams,
+    cancellation_rx: oneshot::Receiver<()>,
+) -> api::ResponseStream {
+    let (tx, rx) = mpsc::unbounded();
+    tokio::spawn(async move {
+        if let Err(error) = run_codex_app_server(params, cancellation_rx, tx.clone()).await {
+            let _ = tx.unbounded_send(Err(Arc::new(AIApiError::Other(error))));
+        }
+    });
+    Box::pin(rx)
 }
 
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
-async fn run_codex_request(
+async fn run_codex_app_server(
     params: api::RequestParams,
     mut cancellation_rx: oneshot::Receiver<()>,
-) -> anyhow::Result<Vec<warp_multi_agent_api::ResponseEvent>> {
+    tx: mpsc::UnboundedSender<api::Event>,
+) -> anyhow::Result<()> {
     let prompt = params
         .input
         .iter()
         .rev()
         .find_map(|input| input.user_query())
-        .ok_or_else(|| anyhow!("Codex inference currently supports user prompts only"))?;
+        .ok_or_else(|| anyhow!("Codex inference currently supports user prompts only"))?
+        .to_owned();
     let (task_id, create_root_task) = params
         .tasks
         .first()
@@ -807,193 +819,819 @@ async fn run_codex_request(
         .conversation_token
         .as_ref()
         .map(|token| token.as_str().to_owned());
+    let working_directory = params.session_context.current_working_directory();
+    let cwd = working_directory.clone();
 
     let mut command = Command::new("codex");
-    command.arg("exec");
-    if let Some(thread_id) = &existing_thread_id {
-        command.args(["resume", "--json", "--skip-git-repo-check", thread_id, "-"]);
-    } else {
-        command.args([
-            "--json",
-            "--sandbox",
-            "workspace-write",
-            "--skip-git-repo-check",
-            "-",
-        ]);
-    }
-    if let Some(working_directory) = params.session_context.current_working_directory() {
-        command.current_dir(working_directory);
-    }
     command
+        .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(working_directory) = &working_directory {
+        command.current_dir(working_directory);
+    }
 
     let mut child = command
         .spawn()
-        .map_err(|error| anyhow!("Failed to launch Codex CLI: {error}"))?;
-    let mut stdin = child
+        .map_err(|error| anyhow!("Failed to launch Codex app-server: {error}"))?;
+    let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("Failed to open Codex CLI stdin"))?;
-    stdin
-        .write_all(prompt.as_bytes())
-        .await
-        .map_err(|error| anyhow!("Failed to send the prompt to Codex CLI: {error}"))?;
-    drop(stdin);
+        .ok_or_else(|| anyhow!("Failed to open Codex app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Failed to open Codex app-server stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to open Codex app-server stderr"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut output = String::new();
+        let _ = stderr.read_to_string(&mut output).await;
+        output
+    });
+    let mut stdin = BufWriter::new(stdin);
+    let mut lines = BufReader::new(stdout).lines();
 
-    let output = tokio::select! {
-        output = child.wait_with_output() => output
-            .map_err(|error| anyhow!("Failed while waiting for Codex CLI: {error}"))?,
-        _ = &mut cancellation_rx => return Err(anyhow!("Codex request cancelled")),
+    write_codex_rpc(
+        &mut stdin,
+        &serde_json::json!({
+            "method": "initialize",
+            "id": CODEX_INITIALIZE_REQUEST_ID,
+            "params": {
+                "clientInfo": {
+                    "name": "warp_agent_cli",
+                    "title": "Warp Agent CLI",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+    )
+    .await?;
+    read_codex_rpc_response(
+        &mut lines,
+        CODEX_INITIALIZE_REQUEST_ID,
+        &mut cancellation_rx,
+    )
+    .await?;
+    write_codex_rpc(
+        &mut stdin,
+        &serde_json::json!({ "method": "initialized", "params": {} }),
+    )
+    .await?;
+
+    let thread_request = if let Some(thread_id) = &existing_thread_id {
+        serde_json::json!({
+            "method": "thread/resume",
+            "id": CODEX_THREAD_REQUEST_ID,
+            "params": {
+                "threadId": thread_id,
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write"
+            }
+        })
+    } else {
+        serde_json::json!({
+            "method": "thread/start",
+            "id": CODEX_THREAD_REQUEST_ID,
+            "params": {
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+                "serviceName": "warp_agent_cli"
+            }
+        })
     };
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if !output.status.success() {
-        let detail = if stderr.is_empty() {
-            format!("Codex CLI exited with {}", output.status)
-        } else {
-            stderr
-        };
-        return Err(anyhow!(detail));
-    }
+    write_codex_rpc(&mut stdin, &thread_request).await?;
+    let thread_result =
+        read_codex_rpc_response(&mut lines, CODEX_THREAD_REQUEST_ID, &mut cancellation_rx).await?;
+    let thread_id = thread_result
+        .pointer("/thread/id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Codex app-server did not return a thread ID"))?
+        .to_owned();
+    let mut mapper = CodexEventMapper::new(task_id, thread_id, create_root_task);
+    send_codex_events(&tx, vec![Ok(mapper.init_event())])?;
 
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| anyhow!("Codex CLI returned invalid UTF-8: {error}"))?;
-    let codex_output = parse_codex_jsonl(&stdout, existing_thread_id.as_deref())?;
-    Ok(codex_response_events(
-        &task_id,
-        &codex_output.thread_id,
-        &codex_output.message,
-        create_root_task,
-    ))
-}
+    write_codex_rpc(
+        &mut stdin,
+        &serde_json::json!({
+            "method": "turn/start",
+            "id": CODEX_TURN_REQUEST_ID,
+            "params": {
+                "threadId": mapper.thread_id,
+                "input": [{ "type": "text", "text": prompt }],
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandboxPolicy": { "type": "workspaceWrite" }
+            }
+        }),
+    )
+    .await?;
 
-#[cfg(all(feature = "tui", not(target_family = "wasm")))]
-fn parse_codex_jsonl(
-    stdout: &str,
-    existing_thread_id: Option<&str>,
-) -> anyhow::Result<CodexExecOutput> {
-    let mut thread_id = existing_thread_id.map(str::to_owned);
-    let mut message = None;
-    let mut failure = None;
-
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        let event: serde_json::Value = serde_json::from_str(line)
-            .map_err(|error| anyhow!("Codex CLI returned invalid JSONL: {error}"))?;
-        match event.get("type").and_then(serde_json::Value::as_str) {
-            Some("thread.started") => {
-                thread_id = event
-                    .get("thread_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
+    let mut completed = false;
+    while !completed {
+        tokio::select! {
+            _ = &mut cancellation_rx => {
+                if let Some(turn_id) = mapper.turn_id.as_deref() {
+                    let _ = write_codex_rpc(
+                        &mut stdin,
+                        &serde_json::json!({
+                            "method": "turn/interrupt",
+                            "id": CODEX_INTERRUPT_REQUEST_ID,
+                            "params": {
+                                "threadId": mapper.thread_id,
+                                "turnId": turn_id
+                            }
+                        }),
+                    ).await;
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                }
+                let _ = child.kill().await;
+                return Ok(());
             }
-            Some("item.completed")
-                if event
-                    .pointer("/item/type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("agent_message") =>
-            {
-                message = event
-                    .pointer("/item/text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
+            line = lines.next_line() => {
+                let Some(line) = line.map_err(|error| anyhow!("Failed to read Codex app-server output: {error}"))? else {
+                    break;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let message: serde_json::Value = serde_json::from_str(&line)
+                    .map_err(|error| anyhow!("Codex app-server returned invalid JSONL: {error}"))?;
+                if message.get("id").and_then(serde_json::Value::as_i64)
+                    == Some(CODEX_TURN_REQUEST_ID)
+                {
+                    if let Some(error) = message.get("error") {
+                        return Err(codex_rpc_error(error));
+                    }
+                    if let Some(turn_id) = message
+                        .pointer("/result/turn/id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        mapper.turn_id = Some(turn_id.to_owned());
+                    }
+                    continue;
+                }
+                let (events, turn_completed) = mapper.map_notification(&message)?;
+                send_codex_events(&tx, events)?;
+                completed = turn_completed;
             }
-            Some("turn.failed") | Some("error") => {
-                failure = event
-                    .pointer("/error/message")
-                    .or_else(|| event.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-            }
-            Some(_) | None => {}
         }
     }
 
-    if let Some(failure) = failure {
-        return Err(anyhow!(failure));
+    if !completed {
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| anyhow!("Failed while waiting for Codex app-server: {error}"))?;
+        let stderr = stderr_task.await.unwrap_or_default();
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            anyhow!("Codex app-server exited before completing the turn ({status})")
+        } else {
+            anyhow!(detail.to_owned())
+        });
     }
-    Ok(CodexExecOutput {
-        thread_id: thread_id.ok_or_else(|| anyhow!("Codex CLI did not return a thread ID"))?,
-        message: message.ok_or_else(|| anyhow!("Codex CLI did not return an agent message"))?,
-    })
+
+    let _ = child.kill().await;
+    stderr_task.abort();
+    Ok(())
 }
 
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
-fn codex_response_events(
-    task_id: &str,
-    thread_id: &str,
-    message: &str,
-    create_root_task: bool,
-) -> Vec<warp_multi_agent_api::ResponseEvent> {
-    use warp_multi_agent_api::client_action;
-    use warp_multi_agent_api::response_event::{self, stream_finished};
+async fn write_codex_rpc(
+    stdin: &mut BufWriter<tokio::process::ChildStdin>,
+    message: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut line = serde_json::to_vec(message)
+        .map_err(|error| anyhow!("Failed to encode Codex app-server request: {error}"))?;
+    line.push(b'\n');
+    stdin
+        .write_all(&line)
+        .await
+        .map_err(|error| anyhow!("Failed to write to Codex app-server: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| anyhow!("Failed to flush Codex app-server request: {error}"))
+}
 
-    let request_id = Uuid::new_v4().to_string();
-    let mut actions = Vec::with_capacity(if create_root_task { 2 } else { 1 });
-    if create_root_task {
-        actions.push(warp_multi_agent_api::ClientAction {
-            action: Some(client_action::Action::CreateTask(
-                client_action::CreateTask {
-                    task: Some(warp_multi_agent_api::Task {
-                        id: task_id.to_owned(),
-                        messages: vec![],
-                        dependencies: None,
-                        description: String::new(),
-                        summary: String::new(),
-                        server_data: String::new(),
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+async fn read_codex_rpc_response(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    request_id: i64,
+    cancellation_rx: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<serde_json::Value> {
+    loop {
+        let line = tokio::select! {
+            _ = &mut *cancellation_rx => return Err(anyhow!("Codex request cancelled")),
+            line = lines.next_line() => line
+                .map_err(|error| anyhow!("Failed to read Codex app-server output: {error}"))?,
+        };
+        let Some(line) = line else {
+            return Err(anyhow!("Codex app-server exited during initialization"));
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| anyhow!("Codex app-server returned invalid JSONL: {error}"))?;
+        if message.get("id").and_then(serde_json::Value::as_i64) != Some(request_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            return Err(codex_rpc_error(error));
+        }
+        return message
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("Codex app-server response did not include a result"));
+    }
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn codex_rpc_error(error: &serde_json::Value) -> anyhow::Error {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unknown Codex app-server error");
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    match code {
+        Some(code) => anyhow!("Codex app-server error {code}: {message}"),
+        None => anyhow!(message.to_owned()),
+    }
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn send_codex_events(
+    tx: &mpsc::UnboundedSender<api::Event>,
+    events: Vec<api::Event>,
+) -> anyhow::Result<()> {
+    for event in events {
+        tx.unbounded_send(event)
+            .map_err(|_| anyhow!("Codex response stream was closed"))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexMessageKind {
+    AgentOutput,
+    AgentReasoning,
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+impl CodexMessageKind {
+    fn field_path(self) -> &'static str {
+        match self {
+            Self::AgentOutput => "agent_output.text",
+            Self::AgentReasoning => "agent_reasoning.reasoning",
+        }
+    }
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+struct CodexEventMapper {
+    task_id: String,
+    thread_id: String,
+    request_id: String,
+    turn_id: Option<String>,
+    create_root_task: bool,
+    message_kinds: HashMap<String, CodexMessageKind>,
+    command_output_bytes: HashMap<String, usize>,
+    failure_message: Option<String>,
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+impl CodexEventMapper {
+    fn new(task_id: String, thread_id: String, create_root_task: bool) -> Self {
+        Self {
+            task_id,
+            thread_id,
+            request_id: Uuid::new_v4().to_string(),
+            turn_id: None,
+            create_root_task,
+            message_kinds: HashMap::new(),
+            command_output_bytes: HashMap::new(),
+            failure_message: None,
+        }
+    }
+
+    fn init_event(&self) -> warp_multi_agent_api::ResponseEvent {
+        warp_multi_agent_api::ResponseEvent {
+            r#type: Some(response_event::Type::Init(response_event::StreamInit {
+                request_id: self.request_id.clone(),
+                conversation_id: self.thread_id.clone(),
+                run_id: String::new(),
+            })),
+        }
+    }
+
+    fn map_notification(
+        &mut self,
+        message: &serde_json::Value,
+    ) -> anyhow::Result<(Vec<api::Event>, bool)> {
+        let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
+            return Ok((vec![], false));
+        };
+        let params = message.get("params").unwrap_or(&serde_json::Value::Null);
+        let mut events = Vec::new();
+        let mut completed = false;
+
+        match method {
+            "turn/started" => {
+                self.turn_id = params
+                    .pointer("/turn/id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            "item/agentMessage/delta" => {
+                let (item_id, delta) = codex_delta(params)?;
+                events.push(Ok(self.append_message(
+                    item_id,
+                    CodexMessageKind::AgentOutput,
+                    delta,
+                )));
+            }
+            "item/reasoning/summaryTextDelta" => {
+                let (item_id, delta) = codex_delta(params)?;
+                let summary_index = params
+                    .get("summaryIndex")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
+                events.push(Ok(self.append_message(
+                    &format!("{item_id}-summary-{summary_index}"),
+                    CodexMessageKind::AgentReasoning,
+                    delta,
+                )));
+            }
+            "item/commandExecution/outputDelta" => {
+                let (item_id, delta) = codex_delta(params)?;
+                if let Some(delta) = self.command_output_delta(item_id, delta) {
+                    events.push(Ok(self.append_message(
+                        item_id,
+                        CodexMessageKind::AgentReasoning,
+                        &delta,
+                    )));
+                }
+            }
+            "item/started" => {
+                if let Some(event) = self.map_item_started(params)? {
+                    events.push(Ok(event));
+                }
+            }
+            "item/completed" => {
+                if let Some(event) = self.map_item_completed(params)? {
+                    events.push(Ok(event));
+                }
+            }
+            "turn/plan/updated" => {
+                if let Some(event) = self.map_plan(params) {
+                    events.push(Ok(event));
+                }
+            }
+            "error" => {
+                self.failure_message = params
+                    .pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            "turn/completed" => {
+                for item in params
+                    .pointer("/turn/items")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if item.get("type").and_then(serde_json::Value::as_str) == Some("agentMessage")
+                        && let (Some(item_id), Some(text)) = (
+                            item.get("id").and_then(serde_json::Value::as_str),
+                            item.get("text").and_then(serde_json::Value::as_str),
+                        )
+                    {
+                        events.push(Ok(self.set_message(
+                            item_id,
+                            CodexMessageKind::AgentOutput,
+                            text,
+                        )));
+                    }
+                }
+                let status = params
+                    .pointer("/turn/status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("failed");
+                match status {
+                    "completed" => events.push(Ok(self.finished_event(true))),
+                    "interrupted" => events.push(Ok(self.finished_event(false))),
+                    _ => {
+                        let message = params
+                            .pointer("/turn/error/message")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .or_else(|| self.failure_message.take())
+                            .unwrap_or_else(|| "Codex turn failed".to_owned());
+                        events.push(Err(Arc::new(AIApiError::Other(anyhow!(message)))));
+                    }
+                }
+                completed = true;
+            }
+            "warning"
+            | "configWarning"
+            | "thread/started"
+            | "thread/status/changed"
+            | "thread/tokenUsage/updated"
+            | "turn/diff/updated"
+            | "item/plan/delta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/reasoning/textDelta"
+            | "item/fileChange/outputDelta" => {}
+            _ => {}
+        }
+
+        Ok((events, completed))
+    }
+
+    fn map_item_started(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<Option<warp_multi_agent_api::ResponseEvent>> {
+        let item = params
+            .get("item")
+            .ok_or_else(|| anyhow!("Codex item/started notification omitted the item"))?;
+        let Some(item_type) = item.get("type").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(item_id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let text = match item_type {
+            "commandExecution" => {
+                let command = item
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("command");
+                format!("Running:\n```sh\n{command}\n```\n")
+            }
+            "fileChange" => "Applying file changes…".to_owned(),
+            "mcpToolCall" => format!(
+                "Calling MCP tool `{}/{}`…",
+                item.get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("server"),
+                item.get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+            ),
+            "dynamicToolCall" => format!(
+                "Running tool `{}`…",
+                item.get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+            ),
+            "collabAgentToolCall" => format!(
+                "Coordinating agents with `{}`…",
+                item.get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("agent tool")
+            ),
+            "webSearch" => "Searching the web…".to_owned(),
+            _ => return Ok(None),
+        };
+        Ok(Some(self.set_message(
+            item_id,
+            CodexMessageKind::AgentReasoning,
+            &text,
+        )))
+    }
+
+    fn map_item_completed(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<Option<warp_multi_agent_api::ResponseEvent>> {
+        let item = params
+            .get("item")
+            .ok_or_else(|| anyhow!("Codex item/completed notification omitted the item"))?;
+        let Some(item_type) = item.get("type").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(item_id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let (kind, text) = match item_type {
+            "agentMessage" => (
+                CodexMessageKind::AgentOutput,
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            "commandExecution" => {
+                let command = item
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("command");
+                let exit = item
+                    .get("exitCode")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|code| format!("exit {code}"))
+                    .unwrap_or_else(|| {
+                        item.get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("completed")
+                            .to_owned()
+                    });
+                let output = item
+                    .get("aggregatedOutput")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|output| truncate_codex_output(output, CODEX_MAX_COMMAND_OUTPUT_BYTES))
+                    .filter(|output| !output.is_empty())
+                    .map(|output| format!("\n```text\n{output}\n```"))
+                    .unwrap_or_default();
+                (
+                    CodexMessageKind::AgentReasoning,
+                    format!("Ran:\n```sh\n{command}\n```\n{exit}.{output}"),
+                )
+            }
+            "fileChange" => {
+                let count = item
+                    .get("changes")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                let status = item
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("completed");
+                (
+                    CodexMessageKind::AgentReasoning,
+                    format!("File changes: {status} ({count} updates)."),
+                )
+            }
+            "mcpToolCall" => (
+                CodexMessageKind::AgentReasoning,
+                format!(
+                    "MCP tool `{}/{}`: {}.",
+                    item.get("server")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("server"),
+                    item.get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool"),
+                    item.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("completed")
+                ),
+            ),
+            "dynamicToolCall" | "collabAgentToolCall" => (
+                CodexMessageKind::AgentReasoning,
+                format!(
+                    "Tool `{}`: {}.",
+                    item.get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool"),
+                    item.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("completed")
+                ),
+            ),
+            "webSearch" => (
+                CodexMessageKind::AgentReasoning,
+                "Web search completed.".to_owned(),
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(self.set_message(item_id, kind, &text)))
+    }
+
+    fn map_plan(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Option<warp_multi_agent_api::ResponseEvent> {
+        let turn_id = params
+            .get("turnId")
+            .and_then(serde_json::Value::as_str)
+            .or(self.turn_id.as_deref())?;
+        let entries = params.get("plan")?.as_array()?;
+        let mut text = String::from("Plan:\n");
+        for entry in entries {
+            let step = entry
+                .get("step")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let status = entry
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending");
+            text.push_str(&format!("- [{status}] {step}\n"));
+        }
+        Some(self.set_message(
+            &format!("codex-plan-{turn_id}"),
+            CodexMessageKind::AgentReasoning,
+            &text,
+        ))
+    }
+
+    fn append_message(
+        &mut self,
+        message_id: &str,
+        kind: CodexMessageKind,
+        delta: &str,
+    ) -> warp_multi_agent_api::ResponseEvent {
+        if !self.message_kinds.contains_key(message_id) {
+            return self.add_message(message_id, kind, delta);
+        }
+        use warp_multi_agent_api::client_action;
+
+        self.client_actions_event(vec![warp_multi_agent_api::ClientAction {
+            action: Some(client_action::Action::AppendToMessageContent(
+                client_action::AppendToMessageContent {
+                    task_id: self.task_id.clone(),
+                    message: Some(self.message(message_id, kind, delta)),
+                    mask: Some(prost_types::FieldMask {
+                        paths: vec![kind.field_path().to_owned()],
                     }),
                 },
             )),
-        });
+        }])
     }
-    actions.push(warp_multi_agent_api::ClientAction {
-        action: Some(client_action::Action::AddMessagesToTask(
-            client_action::AddMessagesToTask {
-                task_id: task_id.to_owned(),
-                messages: vec![warp_multi_agent_api::Message {
-                    fetched_memories: vec![],
-                    id: Uuid::new_v4().to_string(),
-                    task_id: task_id.to_owned(),
-                    server_message_data: String::new(),
-                    citations: vec![],
-                    message: Some(warp_multi_agent_api::message::Message::AgentOutput(
-                        warp_multi_agent_api::message::AgentOutput {
-                            text: message.to_owned(),
-                        },
-                    )),
-                    request_id: request_id.clone(),
-                    timestamp: None,
-                }],
-            },
-        )),
-    });
 
-    vec![
-        warp_multi_agent_api::ResponseEvent {
-            r#type: Some(response_event::Type::Init(response_event::StreamInit {
-                request_id: request_id.clone(),
-                conversation_id: thread_id.to_owned(),
-                run_id: String::new(),
-            })),
-        },
+    fn set_message(
+        &mut self,
+        message_id: &str,
+        kind: CodexMessageKind,
+        text: &str,
+    ) -> warp_multi_agent_api::ResponseEvent {
+        if !self.message_kinds.contains_key(message_id) {
+            return self.add_message(message_id, kind, text);
+        }
+        use warp_multi_agent_api::client_action;
+
+        self.client_actions_event(vec![warp_multi_agent_api::ClientAction {
+            action: Some(client_action::Action::UpdateTaskMessage(
+                client_action::UpdateTaskMessage {
+                    task_id: self.task_id.clone(),
+                    message: Some(self.message(message_id, kind, text)),
+                    mask: Some(prost_types::FieldMask {
+                        paths: vec![kind.field_path().to_owned()],
+                    }),
+                },
+            )),
+        }])
+    }
+
+    fn add_message(
+        &mut self,
+        message_id: &str,
+        kind: CodexMessageKind,
+        text: &str,
+    ) -> warp_multi_agent_api::ResponseEvent {
+        use warp_multi_agent_api::client_action;
+
+        self.message_kinds.insert(message_id.to_owned(), kind);
+        let mut actions = Vec::with_capacity(if self.create_root_task { 2 } else { 1 });
+        if self.create_root_task {
+            self.create_root_task = false;
+            actions.push(warp_multi_agent_api::ClientAction {
+                action: Some(client_action::Action::CreateTask(
+                    client_action::CreateTask {
+                        task: Some(warp_multi_agent_api::Task {
+                            id: self.task_id.clone(),
+                            messages: vec![],
+                            dependencies: None,
+                            description: String::new(),
+                            summary: String::new(),
+                            server_data: String::new(),
+                        }),
+                    },
+                )),
+            });
+        }
+        actions.push(warp_multi_agent_api::ClientAction {
+            action: Some(client_action::Action::AddMessagesToTask(
+                client_action::AddMessagesToTask {
+                    task_id: self.task_id.clone(),
+                    messages: vec![self.message(message_id, kind, text)],
+                },
+            )),
+        });
+        self.client_actions_event(actions)
+    }
+
+    fn message(
+        &self,
+        message_id: &str,
+        kind: CodexMessageKind,
+        text: &str,
+    ) -> warp_multi_agent_api::Message {
+        let message = match kind {
+            CodexMessageKind::AgentOutput => warp_multi_agent_api::message::Message::AgentOutput(
+                warp_multi_agent_api::message::AgentOutput {
+                    text: text.to_owned(),
+                },
+            ),
+            CodexMessageKind::AgentReasoning => {
+                warp_multi_agent_api::message::Message::AgentReasoning(
+                    warp_multi_agent_api::message::AgentReasoning {
+                        reasoning: text.to_owned(),
+                        finished_duration: None,
+                    },
+                )
+            }
+        };
+        warp_multi_agent_api::Message {
+            fetched_memories: vec![],
+            id: message_id.to_owned(),
+            task_id: self.task_id.clone(),
+            request_id: self.request_id.clone(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(message),
+        }
+    }
+
+    fn client_actions_event(
+        &self,
+        actions: Vec<warp_multi_agent_api::ClientAction>,
+    ) -> warp_multi_agent_api::ResponseEvent {
         warp_multi_agent_api::ResponseEvent {
             r#type: Some(response_event::Type::ClientActions(
                 response_event::ClientActions { actions },
             )),
-        },
+        }
+    }
+
+    fn finished_event(&self, done: bool) -> warp_multi_agent_api::ResponseEvent {
+        use warp_multi_agent_api::response_event::stream_finished;
+
+        let reason = if done {
+            stream_finished::Reason::Done(stream_finished::Done {})
+        } else {
+            stream_finished::Reason::Other(stream_finished::Other {})
+        };
         warp_multi_agent_api::ResponseEvent {
             r#type: Some(response_event::Type::Finished(
                 response_event::StreamFinished {
-                    reason: Some(stream_finished::Reason::Done(stream_finished::Done {})),
+                    reason: Some(reason),
                     conversation_usage_metadata: None,
                     token_usage: vec![],
                     should_refresh_model_config: false,
                     request_cost: None,
                 },
             )),
-        },
-    ]
+        }
+    }
+
+    fn command_output_delta(&mut self, item_id: &str, delta: &str) -> Option<String> {
+        let bytes = self
+            .command_output_bytes
+            .entry(item_id.to_owned())
+            .or_default();
+        if *bytes >= CODEX_MAX_COMMAND_OUTPUT_BYTES {
+            return None;
+        }
+        let remaining = CODEX_MAX_COMMAND_OUTPUT_BYTES - *bytes;
+        let truncated = truncate_codex_output(delta, remaining);
+        *bytes += truncated.len();
+        let was_truncated = truncated.len() < delta.len();
+        if was_truncated {
+            *bytes = CODEX_MAX_COMMAND_OUTPUT_BYTES;
+            Some(format!("{truncated}\n…command output truncated…\n"))
+        } else {
+            Some(truncated)
+        }
+    }
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn codex_delta(params: &serde_json::Value) -> anyhow::Result<(&str, &str)> {
+    let item_id = params
+        .get("itemId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Codex delta notification omitted itemId"))?;
+    let delta = params
+        .get("delta")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Codex delta notification omitted delta"))?;
+    Ok((item_id, delta))
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+fn truncate_codex_output(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_owned();
+    }
+    let mut end = max_bytes;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output[..end].to_owned()
 }
 
 /// Applies the result of a request-time GEAP mint to the request snapshot.

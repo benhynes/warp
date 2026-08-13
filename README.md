@@ -48,7 +48,7 @@ cargo build -p warp_tui --bin warp-tui-oss
 ./target/debug/warp-tui-oss --provider codex
 ```
 
-Initial prompts create a Codex thread and follow-up prompts resume it for the life of the Warp session. Codex runs with its `workspace-write` sandbox. The adapter currently returns completed agent messages rather than token-by-token output, and `--resume` across Warp process restarts remains tied to Warp's conversation service.
+Initial prompts create a Codex thread and follow-up prompts resume it for the life of the Warp session. Codex runs with its `workspace-write` sandbox. The adapter uses Codex app-server to stream agent text, reasoning, plans, and tool progress into Warp as they happen. `--resume` across Warp process restarts remains tied to Warp's conversation service.
 
 ## Warp Contributions Overview Dashboard
 

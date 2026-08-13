@@ -1,8 +1,8 @@
 #[cfg(not(target_family = "wasm"))]
 use super::apply_geap_refresh_to_params;
-use super::{RecoveryAction, recovery_action};
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
-use super::{codex_response_events, parse_codex_jsonl};
+use super::{CodexEventMapper, CodexMessageKind, truncate_codex_output};
+use super::{RecoveryAction, recovery_action};
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::agent::api::RequestParams;
 
@@ -91,72 +91,164 @@ fn non_recoverable_post_action_failure_is_terminal() {
 
 #[cfg(all(feature = "tui", not(target_family = "wasm")))]
 #[test]
-fn parses_codex_thread_and_final_message() {
-    let output = parse_codex_jsonl(
-        r#"{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done."}}
-{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
-        None,
-    )
-    .expect("valid Codex JSONL should parse");
+fn codex_first_delta_creates_root_task_and_streaming_message() {
+    let mut mapper = CodexEventMapper::new("root-task".into(), "thread-id".into(), true);
+    let (events, completed) = mapper
+        .map_notification(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-id",
+                "turnId": "turn-id",
+                "itemId": "message-id",
+                "delta": "Hello"
+            }
+        }))
+        .expect("agent delta should map");
 
-    assert_eq!(output.thread_id, "0199a213-81c0-7800-8aa1-bbab2a035a53");
-    assert_eq!(output.message, "Done.");
-}
-
-#[cfg(all(feature = "tui", not(target_family = "wasm")))]
-#[test]
-fn resumed_codex_output_reuses_existing_thread_id() {
-    let output = parse_codex_jsonl(
-        r#"{"type":"item.completed","item":{"type":"agent_message","text":"Follow-up."}}
-{"type":"turn.completed"}"#,
-        Some("0199a213-81c0-7800-8aa1-bbab2a035a53"),
-    )
-    .expect("resume output should use the requested thread ID");
-
-    assert_eq!(output.thread_id, "0199a213-81c0-7800-8aa1-bbab2a035a53");
-    assert_eq!(output.message, "Follow-up.");
-}
-
-#[cfg(all(feature = "tui", not(target_family = "wasm")))]
-#[test]
-fn codex_output_maps_to_warp_response_events() {
-    let events = codex_response_events("root-task", "thread-id", "Hello from Codex", false);
-
-    assert_eq!(events.len(), 3);
-    assert!(matches!(
-        events[0].r#type,
-        Some(warp_multi_agent_api::response_event::Type::Init(_))
-    ));
-    assert!(matches!(
-        events[1].r#type,
-        Some(warp_multi_agent_api::response_event::Type::ClientActions(_))
-    ));
-    assert!(matches!(
-        events[2].r#type,
-        Some(warp_multi_agent_api::response_event::Type::Finished(_))
-    ));
-}
-
-#[cfg(all(feature = "tui", not(target_family = "wasm")))]
-#[test]
-fn first_codex_output_creates_the_optimistic_root_task() {
-    let events = codex_response_events("root-task", "thread-id", "Hello from Codex", true);
-    let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) =
-        &events[1].r#type
+    assert!(!completed);
+    let Ok(event) = &events[0] else {
+        panic!("expected response event");
+    };
+    let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) = &event.r#type
     else {
         panic!("expected client actions");
     };
-
     assert!(matches!(
-        actions.actions[0].action,
+        &actions.actions[0].action,
         Some(warp_multi_agent_api::client_action::Action::CreateTask(_))
     ));
+    let Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(add)) =
+        &actions.actions[1].action
+    else {
+        panic!("expected message creation");
+    };
+    assert_eq!(add.messages[0].id, "message-id");
     assert!(matches!(
-        actions.actions[1].action,
-        Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(_))
+        &add.messages[0].message,
+        Some(warp_multi_agent_api::message::Message::AgentOutput(output))
+            if output.text == "Hello"
     ));
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn codex_later_delta_appends_to_the_existing_message() {
+    let mut mapper = CodexEventMapper::new("root-task".into(), "thread-id".into(), false);
+    let _ = mapper.append_message("message-id", CodexMessageKind::AgentOutput, "Hello");
+    let event = mapper.append_message("message-id", CodexMessageKind::AgentOutput, " world");
+    let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) = event.r#type
+    else {
+        panic!("expected client actions");
+    };
+    let Some(warp_multi_agent_api::client_action::Action::AppendToMessageContent(append)) =
+        &actions.actions[0].action
+    else {
+        panic!("expected message append");
+    };
+    assert_eq!(
+        append.mask.as_ref().map(|mask| mask.paths.as_slice()),
+        Some(["agent_output.text".to_owned()].as_slice())
+    );
+    assert!(matches!(
+        append.message.as_ref().and_then(|message| message.message.as_ref()),
+        Some(warp_multi_agent_api::message::Message::AgentOutput(output))
+            if output.text == " world"
+    ));
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn codex_completed_message_reconciles_authoritative_text() {
+    let mut mapper = CodexEventMapper::new("root-task".into(), "thread-id".into(), false);
+    let _ = mapper.append_message("message-id", CodexMessageKind::AgentOutput, "Hel");
+    let (events, _) = mapper
+        .map_notification(&serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": { "type": "agentMessage", "id": "message-id", "text": "Hello" }
+            }
+        }))
+        .expect("completed message should map");
+    let Ok(event) = &events[0] else {
+        panic!("expected response event");
+    };
+    let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) = &event.r#type
+    else {
+        panic!("expected client actions");
+    };
+    assert!(matches!(
+        &actions.actions[0].action,
+        Some(warp_multi_agent_api::client_action::Action::UpdateTaskMessage(update))
+            if matches!(
+                update.message.as_ref().and_then(|message| message.message.as_ref()),
+                Some(warp_multi_agent_api::message::Message::AgentOutput(output))
+                    if output.text == "Hello"
+            )
+    ));
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn codex_command_start_surfaces_live_progress() {
+    let mut mapper = CodexEventMapper::new("root-task".into(), "thread-id".into(), false);
+    let (events, _) = mapper
+        .map_notification(&serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "command-id",
+                    "command": "cargo test"
+                }
+            }
+        }))
+        .expect("command start should map");
+    let Ok(event) = &events[0] else {
+        panic!("expected response event");
+    };
+    let Some(warp_multi_agent_api::response_event::Type::ClientActions(actions)) = &event.r#type
+    else {
+        panic!("expected client actions");
+    };
+    assert!(matches!(
+        &actions.actions[0].action,
+        Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(add))
+            if matches!(
+                add.messages[0].message.as_ref(),
+                Some(warp_multi_agent_api::message::Message::AgentReasoning(reasoning))
+                    if reasoning.reasoning.contains("cargo test")
+            )
+    ));
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn codex_turn_completion_finishes_the_warp_stream() {
+    let mut mapper = CodexEventMapper::new("root-task".into(), "thread-id".into(), false);
+    let (events, completed) = mapper
+        .map_notification(&serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-id",
+                "turn": { "id": "turn-id", "status": "completed", "items": [] }
+            }
+        }))
+        .expect("turn completion should map");
+
+    assert!(completed);
+    assert!(matches!(
+        &events[0],
+        Ok(warp_multi_agent_api::ResponseEvent {
+            r#type: Some(warp_multi_agent_api::response_event::Type::Finished(_))
+        })
+    ));
+}
+
+#[cfg(all(feature = "tui", not(target_family = "wasm")))]
+#[test]
+fn codex_output_truncation_preserves_utf8_boundaries() {
+    assert_eq!(truncate_codex_output("a🙂b", 3), "a");
+    assert_eq!(truncate_codex_output("a🙂b", 5), "a🙂");
 }
 
 #[cfg(not(target_family = "wasm"))]
